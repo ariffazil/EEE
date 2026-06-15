@@ -2,7 +2,7 @@
   "dataset": "EEE",
   "title": "Kernel Spine Recovery",
   "version": "v1",
-  "timestamp": "2026-06-15T01:31:19Z",
+  "timestamp": "2026-06-15T01:33:04Z",
   "run_status": "PASS",
   "kernel_status": "SEAL",
   "degraded_organs": [],
@@ -32,7 +32,7 @@
       "verdict": "SEAL"
     }
   ],
-  "receipts_sha256": "sha256:2239e6cfdb990363933763ada77a7b6d002f92238ccc7fefbfcc9db24a66a8d8",
+  "receipts_sha256": "sha256:010ca4c3c27d997cecdab627e8fe7cede166610d7f91b16308d02d1537608bd5",
   "final_verdict": "SEAL",
   "dominance_rule": "VOID > DEGRADED > HOLD > SABAR > PARTIAL > SEAL"
 }

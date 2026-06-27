@@ -56,6 +56,7 @@ DOMINANCE_RANK = {v: i for i, v in enumerate(DOMINANCE_ORDER)}
 # Utility functions
 # -----------------------------------------------------------------------------
 
+
 def now_iso() -> str:
     """ISO 8601 UTC timestamp."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -85,7 +86,9 @@ def http_get(url: str, timeout: float = 5.0) -> tuple[int, dict | str]:
 def http_post(url: str, payload: dict, timeout: float = 5.0) -> tuple[int, dict | str]:
     """HTTP POST with JSON body. Returns (status_code, body)."""
     data = json.dumps(payload).encode()
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}
+    )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = resp.read().decode()
@@ -99,12 +102,89 @@ def http_post(url: str, payload: dict, timeout: float = 5.0) -> tuple[int, dict 
         return 0, f"connection_error: {type(e).__name__}: {e}"
 
 
-def make_receipt(probe_id: str, organ: str, input_data: Any, result: dict,
-                 verdict: str, degraded: bool, actor_verified: bool,
-                 lease_scope: list, mutation_allowed: bool,
-                 constitution_hash: str = "", schema_hash: str = "") -> dict:
-    """Build a receipt matching the EEE schema."""
-    # Compute self-hash
+def probe_kernel_protocol() -> dict:
+    """Probe arifOS MCP /mcp initialize to extract protocol_version.
+
+    Added 2026-06-27 by FORGE per F13 ratification — protocol version sentinel
+    for EEE receipts. Ensures that if the kernel protocol upgrades again,
+    EEE receipts from older protocol versions are flagged as potentially stale
+    rather than silently issuing wrong verdicts.
+
+    Returns dict with: protocol_version, kernel_version, server_name, transport.
+    On failure: dict with protocol_version="UNKNOWN", error=<message>.
+    """
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 0,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-25",  # offer oldest — server picks
+            "capabilities": {},
+            "clientInfo": {"name": "eee-protocol-sentinel", "version": "1.0"},
+        },
+    }
+    data = json.dumps(payload).encode()
+    # MCP requires Accept: application/json, text/event-stream (Streamable HTTP).
+    # http_post helper does not set Accept — bypass and use direct urllib here.
+    req = urllib.request.Request(
+        f"{ARIFOS_BASE}/mcp",
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
+            body_text = resp.read().decode()
+        body = json.loads(body_text)
+        if not isinstance(body, dict) or "result" not in body:
+            return {
+                "protocol_version": "UNKNOWN",
+                "kernel_version": "UNKNOWN",
+                "server_name": "UNKNOWN",
+                "error": f"unexpected_body:{str(body)[:200]}",
+            }
+        result = body.get("result", {})
+        server_info = result.get("serverInfo", {})
+        capabilities = result.get("capabilities", {})
+        return {
+            "protocol_version": result.get("protocolVersion", "UNKNOWN"),
+            "kernel_version": server_info.get("version", "UNKNOWN"),
+            "server_name": server_info.get("name", "UNKNOWN"),
+            "transport": "streamable-http" if "tasks" in capabilities else "http",
+        }
+    except Exception as e:
+        return {
+            "protocol_version": "UNKNOWN",
+            "kernel_version": "UNKNOWN",
+            "server_name": "UNKNOWN",
+            "error": f"{type(e).__name__}: {e}",
+        }
+
+
+def make_receipt(
+    probe_id: str,
+    organ: str,
+    input_data: Any,
+    result: dict,
+    verdict: str,
+    degraded: bool,
+    actor_verified: bool,
+    lease_scope: list,
+    mutation_allowed: bool,
+    constitution_hash: str = "",
+    schema_hash: str = "",
+    protocol_sentinel: dict | None = None,
+) -> dict:
+    """Build a receipt matching the EEE schema.
+
+    protocol_sentinel (added 2026-06-27 by FORGE per F13 ratification): captures
+    the MCP protocol version + kernel version at time of probe. Lets EEE receipts
+    carry provenance for the kernel protocol they were run against, so protocol
+    drift is detectable post-hoc rather than silently producing wrong verdicts.
+    """
+    sentinel = protocol_sentinel or {}
     receipt_body = {
         "probe_id": probe_id,
         "timestamp": now_iso(),
@@ -120,6 +200,11 @@ def make_receipt(probe_id: str, organ: str, input_data: Any, result: dict,
         "external_side_effect_allowed": mutation_allowed,  # same gate
         "irreversible_allowed": mutation_allowed and False,  # conservative
         "result": result,
+        # ── Protocol version sentinel (F13 ratified 2026-06-27) ─────────
+        "mcp_protocol_version": sentinel.get("protocol_version", "UNKNOWN"),
+        "kernel_version": sentinel.get("kernel_version", "UNKNOWN"),
+        "kernel_server_name": sentinel.get("server_name", "UNKNOWN"),
+        "eee_runner_version": "v1.1.0",
     }
     receipt_body["receipt_sha256"] = sha256_hex(receipt_body)
     return receipt_body
@@ -147,7 +232,8 @@ def dominance_max(verdicts: list[str]) -> str:
 # Probe 1 — Kernel self-attestation
 # -----------------------------------------------------------------------------
 
-def probe_001_kernel_self_attest() -> dict:
+
+def probe_001_kernel_self_attest(protocol_sentinel: dict | None = None) -> dict:
     """EEE-001 — Can arifOS observe itself truthfully?"""
     probe_id = "EEE-001_KERNEL_SELF_ATTEST"
     input_data = {"probe": "kernel_self_attest", "timestamp": now_iso()}
@@ -217,7 +303,9 @@ def probe_001_kernel_self_attest() -> dict:
     result = {
         "ping_status": status,
         "health_status": status2,
-        "health_result": health_result if isinstance(health_result, (dict, str)) else str(health_result),
+        "health_result": health_result
+        if isinstance(health_result, (dict, str))
+        else str(health_result),
         "checks": checks,
         "tool_count": tool_count,
         "degraded": degraded,
@@ -238,6 +326,7 @@ def probe_001_kernel_self_attest() -> dict:
         mutation_allowed=False,
         constitution_hash=constitution_hash,
         schema_hash=schema_hash,
+        protocol_sentinel=protocol_sentinel,
     )
     write_receipt(receipt)
     return receipt
@@ -247,7 +336,8 @@ def probe_001_kernel_self_attest() -> dict:
 # Probe 2 — Organ attestation (all)
 # -----------------------------------------------------------------------------
 
-def probe_002_organ_attest_all() -> dict:
+
+def probe_002_organ_attest_all(protocol_sentinel: dict | None = None) -> dict:
     """EEE-002 — Can arifOS attest all federation organs?"""
     probe_id = "EEE-002_ORGAN_ATTEST_ALL"
     input_data = {"probe": "organ_attest_all", "organs": list(ORGAN_ENDPOINTS.keys())}
@@ -269,11 +359,15 @@ def probe_002_organ_attest_all() -> dict:
             if data["status"] == 200:
                 organs_present.append(organ)
                 if isinstance(data["health"], dict):
-                    color = data["health"].get("owner_summary", {}).get("color", "UNKNOWN")
+                    color = (
+                        data["health"].get("owner_summary", {}).get("color", "UNKNOWN")
+                    )
                     if color == "RED":
                         degraded_organs.append(organ)
                     if organ == "arifOS":
-                        arifos_runtime_drift = data["health"].get("runtime_drift", False)
+                        arifos_runtime_drift = data["health"].get(
+                            "runtime_drift", False
+                        )
                         arifos_degraded = color == "RED"
             else:
                 degraded_organs.append(organ)
@@ -316,6 +410,7 @@ def probe_002_organ_attest_all() -> dict:
         actor_verified=False,
         lease_scope=[],
         mutation_allowed=False,
+        protocol_sentinel=protocol_sentinel,
     )
     write_receipt(receipt)
     return receipt
@@ -325,7 +420,8 @@ def probe_002_organ_attest_all() -> dict:
 # Probe 3 — Degraded dominance (kernel-of-kernel)
 # -----------------------------------------------------------------------------
 
-def probe_003_degraded_dominance() -> dict:
+
+def probe_003_degraded_dominance(protocol_sentinel: dict | None = None) -> dict:
     """
     EEE-003 — Does inner DEGRADED dominate outer SEAL?
 
@@ -346,7 +442,7 @@ def probe_003_degraded_dominance() -> dict:
             "inner_state": "DEGRADED",
             "requested_outer": "SEAL",
             "expected_dominance": "DEGRADED > SEAL",
-        }
+        },
     }
 
     # Inspect: did probe 001 correctly downgrade?
@@ -354,7 +450,9 @@ def probe_003_degraded_dominance() -> dict:
     with open(RECEIPTS_FILE) as f:
         receipts = [json.loads(line) for line in f if line.strip()]
 
-    p001 = next((r for r in receipts if r["probe_id"] == "EEE-001_KERNEL_SELF_ATTEST"), None)
+    p001 = next(
+        (r for r in receipts if r["probe_id"] == "EEE-001_KERNEL_SELF_ATTEST"), None
+    )
 
     inner_degraded = False
     outer_seal_while_degraded = False
@@ -363,7 +461,7 @@ def probe_003_degraded_dominance() -> dict:
     if p001:
         inner_degraded = p001.get("degraded", False)
         outer_verdict = p001.get("verdict", "")
-        outer_seal_while_degraded = (outer_verdict == "SEAL" and inner_degraded)
+        outer_seal_while_degraded = outer_verdict == "SEAL" and inner_degraded
         # Correct dominance: if inner is DEGRADED, outer must not be SEAL
         dominance_correct = not outer_seal_while_degraded
 
@@ -409,6 +507,7 @@ def probe_003_degraded_dominance() -> dict:
         actor_verified=False,
         lease_scope=[],
         mutation_allowed=False,
+        protocol_sentinel=protocol_sentinel,
     )
     write_receipt(receipt)
     return receipt
@@ -418,7 +517,8 @@ def probe_003_degraded_dominance() -> dict:
 # Probe 4 — Lease/actor authority
 # -----------------------------------------------------------------------------
 
-def probe_004_lease_authority() -> dict:
+
+def probe_004_lease_authority(protocol_sentinel: dict | None = None) -> dict:
     """
     EEE-004 — Can an anonymous actor mutate state?
 
@@ -439,9 +539,7 @@ def probe_004_lease_authority() -> dict:
         "organ_id": "arifOS",
         "scope": ["mutation", "publish", "seal"],
     }
-    status, lease_result = http_post(
-        f"{ARIFOS_BASE}/lease/issue", payload, timeout=5.0
-    )
+    status, lease_result = http_post(f"{ARIFOS_BASE}/lease/issue", payload, timeout=5.0)
 
     # Inspect: should refuse anonymous mutation
     mutation_allowed = False
@@ -455,7 +553,11 @@ def probe_004_lease_authority() -> dict:
             mutation_allowed = True
             refused_correctly = False
         # If kernel explicitly refuses, that's correct
-        if lease_result.get("refused") or lease_result.get("error") or status in (401, 403):
+        if (
+            lease_result.get("refused")
+            or lease_result.get("error")
+            or status in (401, 403)
+        ):
             refused_correctly = True
 
     # Also check: does arifOS expose lease issuance at all?
@@ -478,7 +580,9 @@ def probe_004_lease_authority() -> dict:
 
     result = {
         "lease_attempt_status": status,
-        "lease_result": lease_result if isinstance(lease_result, (dict, str)) else str(lease_result),
+        "lease_result": lease_result
+        if isinstance(lease_result, (dict, str))
+        else str(lease_result),
         "endpoint_available": endpoint_available,
         "mutation_allowed": mutation_allowed,
         "refused_correctly": refused_correctly,
@@ -495,6 +599,7 @@ def probe_004_lease_authority() -> dict:
         actor_verified=False,  # anonymous
         lease_scope=[],
         mutation_allowed=mutation_allowed,
+        protocol_sentinel=protocol_sentinel,
     )
     write_receipt(receipt)
     return receipt
@@ -504,7 +609,8 @@ def probe_004_lease_authority() -> dict:
 # Probe 5 — Receipt integrity
 # -----------------------------------------------------------------------------
 
-def probe_005_receipt_integrity() -> dict:
+
+def probe_005_receipt_integrity(protocol_sentinel: dict | None = None) -> dict:
     """EEE-005 — Is every receipt well-formed and sealed?"""
     probe_id = "EEE-005_RECEIPT_INTEGRITY"
 
@@ -515,9 +621,24 @@ def probe_005_receipt_integrity() -> dict:
     input_data = {"probe": "receipt_integrity", "receipt_count": len(receipts)}
 
     required_fields = [
-        "probe_id", "timestamp", "organ_id", "input_hash",
-        "constitution_hash", "schema_hash", "verdict", "degraded",
-        "actor_verified", "lease_scope", "mutation_allowed", "receipt_sha256",
+        "probe_id",
+        "timestamp",
+        "organ_id",
+        "input_hash",
+        "constitution_hash",
+        "schema_hash",
+        "verdict",
+        "degraded",
+        "actor_verified",
+        "lease_scope",
+        "mutation_allowed",
+        "receipt_sha256",
+        # ── Protocol version sentinel (F13 ratified 2026-06-27) ─────────
+        # Receipts lacking these fields are flagged as pre-sentinel vintage.
+        "mcp_protocol_version",
+        "kernel_version",
+        "kernel_server_name",
+        "eee_runner_version",
     ]
     allowed_verdicts = set(DOMINANCE_ORDER)
 
@@ -538,7 +659,12 @@ def probe_005_receipt_integrity() -> dict:
             issues.append("invalid_timestamp")
 
         # Validate hash format — accept "sha256:HEX" OR plain HEX (≥16 chars)
-        for hash_field in ["input_hash", "constitution_hash", "schema_hash", "receipt_sha256"]:
+        for hash_field in [
+            "input_hash",
+            "constitution_hash",
+            "schema_hash",
+            "receipt_sha256",
+        ]:
             val = r.get(hash_field, "")
             if isinstance(val, dict):
                 # Some kernels return hash as dict {algorithm, b3_hash, ...}
@@ -550,8 +676,10 @@ def probe_005_receipt_integrity() -> dict:
                     val = str(val)
             val = str(val) if val else ""
             if val and not (
-                val.startswith("sha256:") or
-                (len(val) >= 16 and all(c in "0123456789abcdef" for c in val.lower()))
+                val.startswith("sha256:")
+                or (
+                    len(val) >= 16 and all(c in "0123456789abcdef" for c in val.lower())
+                )
             ):
                 issues.append(f"invalid_hash_format:{hash_field}")
 
@@ -580,11 +708,13 @@ def probe_005_receipt_integrity() -> dict:
         if not valid:
             all_valid = False
 
-        validation_results.append({
-            "probe_id": r.get("probe_id", "unknown"),
-            "valid": valid,
-            "issues": issues,
-        })
+        validation_results.append(
+            {
+                "probe_id": r.get("probe_id", "unknown"),
+                "valid": valid,
+                "issues": issues,
+            }
+        )
 
     checks = {
         "all_receipts_have_required_fields": all_valid,
@@ -593,16 +723,13 @@ def probe_005_receipt_integrity() -> dict:
             for vr in validation_results
         ),
         "all_hashes_sha256": all(
-            "invalid_hash_format" not in str(vr["issues"])
-            for vr in validation_results
+            "invalid_hash_format" not in str(vr["issues"]) for vr in validation_results
         ),
         "all_verdicts_valid": all(
-            "invalid_verdict" not in str(vr["issues"])
-            for vr in validation_results
+            "invalid_verdict" not in str(vr["issues"]) for vr in validation_results
         ),
         "all_self_hashes_match": all(
-            "self_hash_mismatch" not in str(vr["issues"])
-            for vr in validation_results
+            "self_hash_mismatch" not in str(vr["issues"]) for vr in validation_results
         ),
     }
 
@@ -628,6 +755,7 @@ def probe_005_receipt_integrity() -> dict:
         actor_verified=False,
         lease_scope=[],
         mutation_allowed=False,
+        protocol_sentinel=protocol_sentinel,
     )
     write_receipt(receipt)
     return receipt
@@ -637,6 +765,7 @@ def probe_005_receipt_integrity() -> dict:
 # Main runner
 # -----------------------------------------------------------------------------
 
+
 def run_eee() -> dict:
     """Run all 5 EEE probes and produce summary."""
     print("=" * 70)
@@ -644,6 +773,18 @@ def run_eee() -> dict:
     print("=" * 70)
     print(f"Timestamp: {now_iso()}")
     print(f"Target: {ARIFOS_BASE}")
+    print()
+
+    # ── Protocol version sentinel (F13 ratified 2026-06-27) ───────────────
+    # Probe kernel MCP protocol version ONCE at run start. Every receipt
+    # in this run carries the same provenance so post-hoc analysis can
+    # detect when the kernel protocol has drifted.
+    protocol_sentinel = probe_kernel_protocol()
+    print(
+        f"[protocol-sentinel] MCP={protocol_sentinel.get('protocol_version')}"
+        f"  kernel={protocol_sentinel.get('kernel_version')}"
+        f"  server={protocol_sentinel.get('server_name')}"
+    )
     print()
 
     # Clear previous receipts
@@ -657,33 +798,39 @@ def run_eee() -> dict:
     # Run probes in order
     receipts = []
     print("[1/5] EEE-001_KERNEL_SELF_ATTEST")
-    r = probe_001_kernel_self_attest()
+    r = probe_001_kernel_self_attest(protocol_sentinel=protocol_sentinel)
     receipts.append(r)
     print(f"      verdict: {r['verdict']}, degraded: {r['degraded']}")
     print()
 
     print("[2/5] EEE-002_ORGAN_ATTEST_ALL")
-    r = probe_002_organ_attest_all()
+    r = probe_002_organ_attest_all(protocol_sentinel=protocol_sentinel)
     receipts.append(r)
     print(f"      verdict: {r['verdict']}, degraded: {r['degraded']}")
     print()
 
     print("[3/5] EEE-003_DEGRADED_DOMINANCE")
-    r = probe_003_degraded_dominance()
+    r = probe_003_degraded_dominance(protocol_sentinel=protocol_sentinel)
     receipts.append(r)
-    print(f"      verdict: {r['verdict']}, dominance_correct: {r['result'].get('dominance_correct')}")
+    print(
+        f"      verdict: {r['verdict']}, dominance_correct: {r['result'].get('dominance_correct')}"
+    )
     print()
 
     print("[4/5] EEE-004_LEASE_AUTHORITY")
-    r = probe_004_lease_authority()
+    r = probe_004_lease_authority(protocol_sentinel=protocol_sentinel)
     receipts.append(r)
-    print(f"      verdict: {r['verdict']}, mutation_allowed: {r['result'].get('mutation_allowed')}")
+    print(
+        f"      verdict: {r['verdict']}, mutation_allowed: {r['result'].get('mutation_allowed')}"
+    )
     print()
 
     print("[5/5] EEE-005_RECEIPT_INTEGRITY")
-    r = probe_005_receipt_integrity()
+    r = probe_005_receipt_integrity(protocol_sentinel=protocol_sentinel)
     receipts.append(r)
-    print(f"      verdict: {r['verdict']}, valid: {r['result'].get('valid_count')}/{r['result'].get('receipt_count')}")
+    print(
+        f"      verdict: {r['verdict']}, valid: {r['result'].get('valid_count')}/{r['result'].get('receipt_count')}"
+    )
     print()
 
     # Aggregate final verdict
@@ -691,7 +838,9 @@ def run_eee() -> dict:
     final_verdict = dominance_max(verdicts)
 
     # Check if arifOS itself is degraded
-    arifos_degraded = receipts[0].get("degraded", False) or receipts[1].get("degraded", False)
+    arifos_degraded = receipts[0].get("degraded", False) or receipts[1].get(
+        "degraded", False
+    )
 
     # Build summary
     pass_count = sum(1 for v in verdicts if v == "SEAL")
@@ -708,7 +857,9 @@ def run_eee() -> dict:
         "title": "Kernel Spine Recovery",
         "version": "v1",
         "timestamp": now_iso(),
-        "run_status": "PASS" if final_verdict == "SEAL" else ("DEGRADED" if final_verdict == "DEGRADED" else "FAIL"),
+        "run_status": "PASS"
+        if final_verdict == "SEAL"
+        else ("DEGRADED" if final_verdict == "DEGRADED" else "FAIL"),
         "kernel_status": final_verdict,
         "degraded_organs": ["arifOS"] if arifos_degraded else [],
         "probe_count": 5,
@@ -716,8 +867,7 @@ def run_eee() -> dict:
         "fail_count": fail_count,
         "hold_count": hold_count,
         "probe_verdicts": [
-            {"id": r["probe_id"], "verdict": r["verdict"]}
-            for r in receipts
+            {"id": r["probe_id"], "verdict": r["verdict"]} for r in receipts
         ],
         "receipts_sha256": f"sha256:{receipts_sha}",
         "final_verdict": final_verdict,
@@ -746,5 +896,6 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"FATAL: {type(e).__name__}: {e}", file=sys.stderr)
         import traceback
+
         traceback.print_exc()
         sys.exit(2)
